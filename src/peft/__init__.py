@@ -122,6 +122,8 @@ from .tuners import (
     get_eva_state_dict,
     initialize_lora_eva_weights,
     save_as_lora,
+    LARSModel,
+    LARSConfig,
 )
 from .tuners.cartridge.utils import (
     compose_cartridge_adapters,

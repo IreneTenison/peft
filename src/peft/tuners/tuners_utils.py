@@ -294,6 +294,7 @@ class BaseTuner(nn.Module, ABC):
 
         self.active_adapter: str | list[str] = adapter_name
         self._pre_injection_hook(self.model, self.peft_config[adapter_name], adapter_name)
+
         if peft_config != PeftType.XLORA or peft_config[adapter_name] != PeftType.XLORA:
             self.inject_adapter(self.model, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage, state_dict=state_dict)
 

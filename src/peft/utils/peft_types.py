@@ -49,6 +49,7 @@ class PeftType(str, enum.Enum):
     - OSF
     - DELORA
     - GRALORA
+    - LARS
     """
 
     PROMPT_TUNING = "PROMPT_TUNING"
@@ -83,6 +84,7 @@ class PeftType(str, enum.Enum):
     DELORA = "DELORA"
     GRALORA = "GRALORA"
     CARTRIDGE = "CARTRIDGE"
+    LARS = "LARS"
 
 
 class TaskType(str, enum.Enum):

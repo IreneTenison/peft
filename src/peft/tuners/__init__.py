@@ -58,6 +58,7 @@ from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .waveft import WaveFTConfig, WaveFTModel
 from .xlora import XLoraConfig, XLoraModel
+from .lars import LARSModel, LARSConfig
 
 
 __all__ = [
@@ -139,4 +140,6 @@ __all__ = [
     "get_eva_state_dict",
     "initialize_lora_eva_weights",
     "save_as_lora",
+    "LARSModel",
+    "LARSConfig",
 ]
