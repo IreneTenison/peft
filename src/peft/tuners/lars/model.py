@@ -9,12 +9,16 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
+import bitsandbytes as bnb
 
 from peft.tuners.tuners_utils import BaseTuner
 from peft.utils import ModulesToSaveWrapper
 
 from .layer import LARSLinear
 from .config import LARSConfig
+
+from peft.import_utils import is_bnb_available, is_bnb_4bit_available 
+from .bnb import LARSLinear4bit, LARSLinear8bitLt 
 
 
 # --------------------------------------------------
@@ -64,6 +68,43 @@ class LARSModel(BaseTuner):
                 return True
         return False
 
+    @staticmethod
+    def _create_new_module(peft_config: LARSConfig, adapter_name: str, target: nn.Module, **kwargs):
+        """Minimal LARS version - Linear + quantized only."""
+        if is_bnb_available():
+            import bitsandbytes as bnb
+            from .bnb import LARSLinear8bitLt
+        
+        if is_bnb_4bit_available():
+            from .bnb import LARSLinear4bit
+        
+        loaded_in_8bit = kwargs.pop("loaded_in_8bit", False)
+        loaded_in_4bit = kwargs.pop("loaded_in_4bit", False)
+        
+        target_base_layer = target.get_base_layer() if hasattr(target, 'get_base_layer') else target
+        
+        if loaded_in_4bit and isinstance(target_base_layer, bnb.nn.Linear4bit):
+            kwargs.update({
+                "compute_dtype": target_base_layer.compute_dtype,
+                "compress_statistics": target_base_layer.weight.compress_statistics,
+                "quant_type": target_base_layer.weight.quant_type,
+            })
+            return LARSLinear4bit(target, adapter_name, **kwargs)
+        
+        elif loaded_in_8bit and isinstance(target_base_layer, bnb.nn.Linear8bitLt):
+            kwargs.update({
+                "has_fp16_weights": target_base_layer.state.has_fp16_weights,
+                "threshold": target_base_layer.state.threshold,
+                "index": target_base_layer.index,
+            })
+            return LARSLinear8bitLt(target, adapter_name, **kwargs)
+        
+        elif isinstance(target_base_layer, nn.Linear):
+            return LARSLinear(base_layer=target, rank=peft_config.rank)
+        
+        return None
+
+
     def _create_and_replace(
         self,
         peft_config: LARSConfig,
@@ -77,14 +118,16 @@ class LARSModel(BaseTuner):
         Replace nn.Linear with LARSLinear.
         """
 
-        if not isinstance(target, nn.Linear):
+        if not isinstance(target, (nn.Linear, bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)):
             return
 
-        new_module = LARSLinear(
-            base_layer=target,
-            rank=peft_config.rank,
-        )
+        qkwargs = {
+            "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
+            "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
+        }
 
+    new_module = self._create_new_module(peft_config, adapter_name, target, **qkwargs)
+    if new_module is not None:
         # Important: keep reference for PEFT bookkeeping
         self._replace_module(parent, target_name, new_module, target)
 
