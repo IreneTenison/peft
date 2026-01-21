@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import bitsandbytes as bnb
 
-from peft.tuners.tuners_utils import BaseTuner
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
 
 from .layer import LARSLinear
@@ -70,38 +70,30 @@ class LARSModel(BaseTuner):
 
     @staticmethod
     def _create_new_module(peft_config: LARSConfig, adapter_name: str, target: nn.Module, **kwargs):
-        """Minimal LARS version - Linear + quantized only."""
         if is_bnb_available():
             import bitsandbytes as bnb
-            from .bnb import LARSLinear8bitLt
-        
-        if is_bnb_4bit_available():
-            from .bnb import LARSLinear4bit
-        
+
         loaded_in_8bit = kwargs.pop("loaded_in_8bit", False)
         loaded_in_4bit = kwargs.pop("loaded_in_4bit", False)
-        
-        target_base_layer = target.get_base_layer() if hasattr(target, 'get_base_layer') else target
-        
-        if loaded_in_4bit and isinstance(target_base_layer, bnb.nn.Linear4bit):
-            kwargs.update({
-                "compute_dtype": target_base_layer.compute_dtype,
-                "compress_statistics": target_base_layer.weight.compress_statistics,
-                "quant_type": target_base_layer.weight.quant_type,
-            })
-            return LARSLinear4bit(target, adapter_name, **kwargs)
-        
-        elif loaded_in_8bit and isinstance(target_base_layer, bnb.nn.Linear8bitLt):
-            kwargs.update({
-                "has_fp16_weights": target_base_layer.state.has_fp16_weights,
-                "threshold": target_base_layer.state.threshold,
-                "index": target_base_layer.index,
-            })
-            return LARSLinear8bitLt(target, adapter_name, **kwargs)
-        
-        elif isinstance(target_base_layer, nn.Linear):
+
+        # Unwrap if already an adapter
+        if isinstance(target, BaseTunerLayer):
+            target_base_layer = target.get_base_layer()
+        else:
+            target_base_layer = target
+
+        # Quantized 4-bit
+        if loaded_in_4bit and "bnb" in globals() and isinstance(target_base_layer, bnb.nn.Linear4bit):
             return LARSLinear(base_layer=target, rank=peft_config.rank)
-        
+
+        # Quantized 8-bit
+        if loaded_in_8bit and "bnb" in globals() and isinstance(target_base_layer, bnb.nn.Linear8bitLt):
+            return LARSLinear(base_layer=target, rank=peft_config.rank)
+
+        # Regular linear
+        if isinstance(target_base_layer, nn.Linear):
+            return LARSLinear(base_layer=target, rank=peft_config.rank)
+
         return None
 
 
@@ -126,10 +118,10 @@ class LARSModel(BaseTuner):
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
 
-    new_module = self._create_new_module(peft_config, adapter_name, target, **qkwargs)
-    if new_module is not None:
-        # Important: keep reference for PEFT bookkeeping
-        self._replace_module(parent, target_name, new_module, target)
+        new_module = self._create_new_module(peft_config, adapter_name, target, **qkwargs)
+        if new_module is not None:
+            # Important: keep reference for PEFT bookkeeping
+            self._replace_module(parent, target_name, new_module, target)
 
     def _replace_module(
         self,
@@ -143,33 +135,37 @@ class LARSModel(BaseTuner):
         """
         setattr(parent, child_name, new_module)
 
-        # Preserve device placement
-        new_module.to(old_module.weight.device)
+        device = old_module.weight.device
+        new_module.to(device) 
+        
+        if hasattr(old_module, "weight"):
+            new_module.base_layer.weight = old_module.weight
+        if hasattr(old_module, "bias") and old_module.bias is not None:
+            new_module.base_layer.bias = old_module.bias
 
     def _mark_only_adapters_as_trainable(self, model: nn.Module):
+        print("=== MARK TRAINABLE DEBUG ===")
         # 1. Freeze everything
         for p in self.model.parameters():
             p.requires_grad = False
 
-        # 2. ENABLE GRADIENT CHECKPOINTING (RIGHT PLACE)
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-        # Required for HF models
-        if hasattr(self.model.config, "use_cache"):
-            self.model.config.use_cache = False
-        
-        if hasattr(self.model.config, "enable_input_require_grads"):
-            self.model.enable_input_require_grads()
-
-
-        # 2. Unfreeze only LARS adapter params
-        for module in self.model.modules():
+        # 2. Unfreeze only LARS adapter params (floating point only)
+        trainable_count = 0
+        for name, module in self.model.named_modules():
             if isinstance(module, LARSLinear):
-                for p in module.U.parameters():
-                    p.requires_grad = True
-                for p in module.V.parameters():
-                    p.requires_grad = True
+                # print(f"Found LARSLinear: {name}")
+                for param_name, param in module.named_parameters():
+                    # Skip quantized base_layer weights (int8) - they MUST stay frozen
+                    if param.dtype not in (torch.float16, torch.float32, torch.bfloat16, torch.float64):
+                        # print(f"  SKIP {param_name}: dtype={param.dtype} (quantized, stays frozen)")
+                        continue
+                    
+                    param.requires_grad = True
+                    trainable_count += param.numel()
+                    # print(f"  Unfroze {param_name}: {param.numel()} params, requires_grad={param.requires_grad}")
+        
+        print(f"Total LARS trainable params: {trainable_count}")
+        print("=== END DEBUG ===")
 
 
 
