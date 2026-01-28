@@ -1,73 +1,93 @@
-# lars/bnb.py
-import bitsandbytes as bnb
-from .layer import LARSLinear
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Any
+from torch.utils.checkpoint import checkpoint
+from peft.import_utils import is_bnb_4bit_available, is_bnb_available
+from .layer import LARSLayer
+
+if is_bnb_available():
+    import bitsandbytes as bnb
+
+    class Linear8bitLt(torch.nn.Module, LARSLayer):
+        def __init__(
+            self,
+            base_layer: torch.nn.Module,
+            adapter_name: str,
+            rank: int,
+            block_size: int = 32,
+            init_lars_weights: bool = True,
+            **kwargs,
+        ) -> None:
+            super().__init__()
+            LARSLayer.__init__(self, base_layer, rank=rank, block_size=block_size)
+        
+            self.get_base_layer().weight.requires_grad = False
+            if getattr(self.get_base_layer(), "bias", None) is not None:
+                self.get_base_layer().bias.requires_grad = False
+
+                self._active_adapter = adapter_name
+                self.update_layer(adapter_name, init_lars_weights)
+
+        def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if self.disable_adapters:
+                return self.base_layer(x, *args, **kwargs)
+
+            requires_conversion = (not torch.is_autocast_enabled()) and (x.dtype != torch.float32)
+            if requires_conversion:
+                x = x.float()
+
+            gate = self._compute_gate_logic(x)  # fp32
+            out = self.base_layer(x * gate.to(x.dtype), *args, **kwargs)
+
+            if requires_conversion:
+                out = out.to(out.dtype)
+            return out
+
+        def __repr__(self) -> str:
+            return "lars." + super().__repr__()
 
 
-class LARSLinear4bit(bnb.nn.Linear4bit):
-    def __init__(self, base_layer: bnb.nn.Linear4bit, adapter_name, **kwargs):
-        # Extract dims from existing layer
-        input_features = base_layer.in_features
-        output_features = base_layer.out_features
-        bias = base_layer.bias is not None
+if is_bnb_4bit_available():
+    import bitsandbytes as bnb 
 
-        compute_dtype = kwargs.pop("compute_dtype", base_layer.compute_dtype)
-        compress_statistics = kwargs.pop("compress_statistics", base_layer.weight.compress_statistics)
-        quant_type = kwargs.pop("quant_type", base_layer.weight.quant_type)
-        rank = kwargs.pop("rank", None)
-        block_size = kwargs.pop("block_size", 32)
+    class Linear4bit(torch.nn.Module, LARSLayer):
+        def __init__(
+            self,
+            base_layer: torch.nn.Module,
+            adapter_name: str,
+            rank: int,
+            block_size: int = 32,
+            init_lars_weights: bool = True,
+            **kwargs,
+        ) -> None:
+            super().__init__()
+            LARSLayer.__init__(self, base_layer, rank=rank, block_size=block_size)
 
-        super().__init__(
-            input_features=input_features,
-            output_features=output_features,
-            bias=bias,
-            compute_dtype=compute_dtype,
-            compress_statistics=compress_statistics,
-            quant_type=quant_type,
-        )
+            # Freeze pretrained weight
+            self.get_base_layer().weight.requires_grad = False
+            if getattr(self.get_base_layer(), "bias", None) is not None:
+                self.get_base_layer().bias.requires_grad = False
 
-        # Reuse quantized weights
-        self.weight = base_layer.weight
+            self._active_adapter = adapter_name
+            self.update_layer(adapter_name, init_lars_weights)
 
-        # Wrap with your existing LARSLinear, **without** changing it
-        if rank is None:
-            raise ValueError("LARSLinear4bit requires 'rank' kwarg from peft_config.")
-        self.lars = LARSLinear(base_layer=self, rank=rank, block_size=block_size)
+        def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if self.disable_adapters:
+                return self.base_layer(x, *args, **kwargs)
 
-    def forward(self, x, *args, **kwargs):
-        base_out = super().forward(x, *args, **kwargs)
-        return self.lars(base_out)
+            requires_conversion = (not torch.is_autocast_enabled()) and (x.dtype != torch.float32)
+            if requires_conversion:
+                x = x.float()
 
+            gate = self._compute_gate_logic(x)
+            out = self.base_layer(x * gate.to(x.dtype), *args, **kwargs)
 
-class LARSLinear8bitLt(bnb.nn.Linear8bitLt):
-    def __init__(self, base_layer: bnb.nn.Linear8bitLt, adapter_name, **kwargs):
-        input_features = base_layer.in_features
-        output_features = base_layer.out_features
-        bias = base_layer.bias is not None
+            out = out.clone()  # IA3/LoRA workaround for some torch/bnb combos
 
-        has_fp16_weights = kwargs.pop("has_fp16_weights", base_layer.state.has_fp16_weights)
-        threshold = kwargs.pop("threshold", base_layer.state.threshold)
-        index = kwargs.pop("index", base_layer.index)
-        rank = kwargs.pop("rank", None)
-        block_size = kwargs.pop("block_size", 32)
+            if requires_conversion:
+                out = out.to(out.dtype)
+            return out
 
-        super().__init__(
-            input_features=input_features,
-            output_features=output_features,
-            bias=bias,
-            has_fp16_weights=has_fp16_weights,
-            threshold=threshold,
-            index=index,
-        )
-
-        # Reuse quantized weights/state
-        self.weight = base_layer.weight
-        self.state = base_layer.state
-        self.index = base_layer.index
-
-        if rank is None:
-            raise ValueError("LARSLinear8bitLt requires 'rank' kwarg from peft_config.")
-        self.lars = LARSLinear(base_layer=self, rank=rank, block_size=block_size)
-
-    def forward(self, x, *args, **kwargs):
-        base_out = super().forward(x, *args, **kwargs)
-        return self.lars(base_out)
+        def __repr__(self) -> str:
+            return "lars." + super().__repr__()

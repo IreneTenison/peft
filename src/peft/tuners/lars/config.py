@@ -99,6 +99,9 @@ class LARSConfig(PeftConfig):
         metadata={"help": "Rank of the low-rank activation adapter"},
     )
 
+    # added 
+    block_size: int = field(default=32, metadata={"help": "Block size for gating along hidden dim."})
+
 
     def __post_init__(self):
         super().__post_init__()

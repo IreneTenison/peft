@@ -16,11 +16,11 @@ from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 from peft.utils import register_peft_method
 
 from .config import LARSConfig
-from .layer import LARSLinear
+from .layer import LARSLayer, Linear
 from .model import LARSModel
 
 
-__all__ = [ "LARSConfig", "LARSLinear", "LARSModel"]
+__all__ = [ "LARSConfig", "LARSLayer", "Linear", "LARSModel"]
 register_peft_method(name="lars", config_cls=LARSConfig, model_cls=LARSModel, is_mixed_compatible=True)
 
 

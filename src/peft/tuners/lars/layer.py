@@ -1,141 +1,127 @@
-# Copyright ...
-# Adapted to mirror peft/tuners/ia3/layer.py
-
+# peft/src/peft/tuners/lars/layer.py
 from __future__ import annotations
-
 import math
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch.utils.checkpoint import checkpoint
 
-# class LARSLinear(nn.Module, BaseTunerLayer):
-#     """
-#     PEFT-compatible low-rank activation scaling layer.
-#     """
-
-#     def __init__(
-#         self,
-#         base_layer: nn.Linear,
-#         rank: int,
-#         activation: str = "silu",
-#     ):
-#         super().__init__()
-
-#         if not isinstance(base_layer, nn.Linear):
-#             raise ValueError("LARSLinear only supports nn.Linear")
-
-#         self.in_features = base_layer.in_features
-#         self.out_features = base_layer.out_features
-#         self.rank = rank
-#         self.scaling = rank
-
-#         self.base_layer = base_layer
-#         self.base_layer.weight.requires_grad_(False)
-#         if self.base_layer.bias is not None:
-#             self.base_layer.bias.requires_grad_(False)
-
-#         self.merged_adapters = []
-
-#         # Low-rank activation adapter
-#         self.U = nn.Linear(self.in_features, rank, bias=False)
-#         nn.init.kaiming_uniform_(self.U.weight, a=math.sqrt(5))
-#         self.V = nn.Linear(rank, self.out_features, bias=False)
-#         nn.init.kaiming_uniform_(self.V.weight, a=math.sqrt(5))
-#         # nn.init.zeros_(self.V.weight)
-#         self.norm = nn.LayerNorm(self.in_features)
-
-#         # Nonlinearity
-#         if activation == "silu":
-#             self.act = nn.SiLU(inplace=True)
-
-#         # Initialization: identity at start (important for stability)
-#         # nn.init.zeros_(self.V.weight)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Forward pass:
-#             h = W x
-#             g = 1 + V(phi(U(h)))
-#             y = h * g
-#         """
-#         # h = self.base_layer(x)
-#         # # gate = 1.0 + self.V(self.act(self.U(h)))
-#         # gate = 1.0 + torch.tanh(self.V(self.act(self.U(self.norm(x)))))
-
-#         # return h * gate
-#         with torch.no_grad():
-#             h = self.base_layer(x)
-#         gate = 1 + 0.5*torch.tanh(self.V(self.act(self.U(self.norm(x)))))
-#         y = h*gate 
-#         return y
-
-
-class LARSLinear(nn.Module, BaseTunerLayer):
+class LARSLayer(BaseTunerLayer):
+    adapter_layer_names = ("lars_params",)
+    
     def __init__(self, base_layer, rank, block_size=32):
-        super().__init__()
-        self.base_layer = base_layer
-        self.base_layer.weight.requires_grad_(False)
+            self.base_layer = base_layer 
+            self.lars_params = nn.ParameterDict({})
+            
+            self._disable_adapters = False
+            self.merged_adapters = [] # not used, for PEFT compatability
 
-        device = base_layer.weight.device
-        dtype = base_layer.weight.dtype
+            self.rank = rank
+            self.block_size = block_size
 
-        if hasattr(base_layer, "compute_dtype"):
-            dtype = base_layer.compute_dtype
-        elif base_layer.weight.dtype.is_floating_point:
-            dtype = base_layer.weight.dtype
-        else:
-            # Fallback for quantized weights that don't expose compute_dtype
-            dtype = torch.bfloat16
+            base = self.get_base_layer()
+            if isinstance(base, nn.Linear):
+                in_features, out_features = base.in_features, base.out_features
+            # elif isinstance(base, Conv1D):
+            #     in_features, out_features = (
+            #         base.weight.ds_shape if hasattr(base.weight, "ds_shape") else base.weight.shape
+            #     )
+            else:
+                raise ValueError(f"Unsupported base layer type for LARS: {type(base)}")
 
-        self.in_features = base_layer.in_features
-        self.out_features = base_layer.out_features
-        self.rank = rank
+            self.in_features = base_layer.in_features
+            self.out_features = base_layer.out_features
 
-        d_out = self.in_features  
-        assert d_out % block_size == 0
+            if self.in_features % self.block_size != 0:
+                raise ValueError(
+                    f"LARS requires in_features divisible by block_size: {self.in_features=} {self.block_size=}"
+                )
 
-        self.block = block_size
-        self.g = d_out // block_size
+            self.g = self.in_features // block_size
 
-        self.norm = nn.RMSNorm(self.in_features, device=device, dtype=dtype)    
-        self.U = nn.Linear(self.in_features, rank, bias=False, device=device, dtype=dtype)
-        self.V = nn.Linear(rank, self.g, bias=False, device=device, dtype=dtype)
-        
-        nn.init.kaiming_uniform_(self.U.weight, a=math.sqrt(5))
-        nn.init.normal_(self.V.weight, std=1e-4)
-        
-        self.alpha = nn.Parameter(
-            torch.tensor(0.1, device=device, dtype=dtype), 
-            requires_grad=True
+    def update_layer(self, adapter_name: str, init_lars_weights: bool, inference_mode: bool = False, **kwargs):
+        U = torch.empty((self.in_features, self.rank), dtype=torch.float32)
+        V = torch.empty((self.rank, self.g), dtype=torch.float32)
+        alpha = torch.tensor(0.1, dtype=torch.float32)
+
+        # Store params
+        self.lars_params[adapter_name] = nn.ParameterDict(
+            {
+                "U": nn.Parameter(U),
+                "V": nn.Parameter(V),
+                "alpha": nn.Parameter(alpha),
+            }
         )
 
-    def forward(self, x):
-        # print(f"DEBUG: x on {x.device}, alpha on {self.alpha.device}")
-        input_device = x.device
-        input_dtype = x.dtype
+        if init_lars_weights:
+            nn.init.kaiming_uniform_(self.lars_params[adapter_name]["U"], a=math.sqrt(5))
+            nn.init.normal_(self.lars_params[adapter_name]["V"], std=1e-4)
 
-        alpha = self.alpha.to(input_device)
-        
-        x_adapter = x.to(self.alpha.dtype)
-        
-        z = self.norm.to(input_device)(x_adapter)
-        gate_small = 1 + alpha * self.V.to(input_device)(self.U.to(input_device)(z))
-        gate = gate_small.repeat_interleave(self.block, dim=-1)
-    
-        scaled_input = (x_adapter * gate).to(input_dtype)
-        
-        return self.base_layer(scaled_input)
+            with torch.no_grad():
+                self.lars_params[adapter_name]["alpha"].fill_(0.1)
 
-    def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}"
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
-    @property
-    def weight(self):
-        return self.base_layer.weight
-    @property
-    def bias(self):
-        return self.base_layer.bias   
+    def reset_lars_parameters(self, adapter_name: str):
+        # Keep U/V as initialized; set alpha to small default.
+        if adapter_name in self.lars_params:
+            with torch.no_grad():
+                self.lars_params[adapter_name]["alpha"].fill_(0.1)
+
+    def _compute_gate_logic(self, x):
+        z = F.rms_norm(x, (self.in_features,), eps=1e-5).to(torch.float32)
+        
+        gate_accum = None
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.lars_params:
+                continue
+            p = self.lars_params[adapter_name]
+            # Projection logic in FP32
+            proj = (z @ p["U"]) @ p["V"]
+            inc = 1.0 + p["alpha"] * proj
+            gate_accum = inc if gate_accum is None else gate_accum * inc # for multiple adapters
+        
+        if gate_accum is None:
+            gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=torch.float32)
+            
+        gate = gate_accum.repeat_interleave(self.block_size, dim=-1)  # [*, in_features]
+        return gate
+
+class Linear(nn.Module, LARSLayer):
+    def __init__(
+        self,
+        base_layer: nn.Module,
+        adapter_name: str,
+        rank: int,
+        block_size: int = 32,
+        init_lars_weights: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        LARSLayer.__init__(self, base_layer, rank=rank, block_size=block_size)
+
+        # Freeze pretrained weights
+        base = self.get_base_layer()
+        if hasattr(base, "weight") and base.weight is not None:
+            base.weight.requires_grad = False
+        if getattr(base, "bias", None) is not None:
+            base.bias.requires_grad = False
+
+        self._active_adapter = adapter_name
+        self.update_layer(adapter_name, init_lars_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        previous_dtype = x.dtype
+        
+        if self.disable_adapters:
+            return self.base_layer(x, *args, **kwargs)
+
+        gate = self._compute_gate(x)  # fp32
+        x = x * gate.to(x.dtype)
+        out = self.base_layer(x, *args, **kwargs)
+        return out.to(previous_dtype)
+
+    def __repr__(self) -> str:
+        return "lars." + super().__repr__()

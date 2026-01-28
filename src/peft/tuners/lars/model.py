@@ -10,15 +10,13 @@ from typing import Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 import bitsandbytes as bnb
-
-from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, check_target_module_exists
 from peft.utils import ModulesToSaveWrapper
-
-from .layer import LARSLinear
-from .config import LARSConfig
-
 from peft.import_utils import is_bnb_available, is_bnb_4bit_available 
-from .bnb import LARSLinear4bit, LARSLinear8bitLt 
+
+from .layer import Linear, LARSLayer
+from .config import LARSConfig
+from .bnb import Linear4bit, Linear8bitLt 
 
 
 # --------------------------------------------------
@@ -36,7 +34,7 @@ class LARSModel(BaseTuner):
     """
 
     prefix = "lars_"
-    tuner_layer_cls = LARSLinear
+    tuner_layer_cls = LARSLayer
 
     def __init__(self, model: nn.Module, config: LARSConfig, adapter_name: str):
         super().__init__(model=model, peft_config=config, adapter_name=adapter_name)
@@ -50,77 +48,143 @@ class LARSModel(BaseTuner):
             raise ValueError("Cannot infer number of transformer layers")
 
     # --------------------------------------------------
-    # Required BaseTuner overrides
+    # Required BaseTuner overrides (COMPLETE)
     # --------------------------------------------------
 
     @staticmethod
-    def _check_target_module_feedforward(lars_config, key) -> bool:
-        """
-        Same logic as IA3: regex or exact match.
-        """
-        if self.peft_config.target_modules is None:
-            return False
-
-        for target in self.peft_config.target_modules:
-            if re.fullmatch(target, key):
-                return True
-            if key.endswith(target):
-                return True
-        return False
+    def _check_target_module_exists(lars_config: LARSConfig, key: str) -> bool:
+        """Check if key matches target_modules."""
+        return check_target_module_exists(lars_config, key)
 
     @staticmethod
-    def _create_new_module(peft_config: LARSConfig, adapter_name: str, target: nn.Module, **kwargs):
+    def _check_target_module_feedforward(lars_config: LARSConfig, key: str) -> bool:
+        """True for FFN layers (input gating), False for attention (output gating)."""
+        if lars_config.feedforward_modules is None:
+            return False
+        return any(re.fullmatch(target, key) or key.endswith(target) 
+                  for target in lars_config.feedforward_modules)
+
+    @staticmethod
+    def _create_new_module(
+        lars_config: LARSConfig, 
+        adapter_name: str, 
+        target: nn.Module, 
+        **kwargs
+    ):
         if is_bnb_available():
             import bitsandbytes as bnb
+            from .bnb import Linear8bitLt
 
+        if is_bnb_4bit_available():
+            from .bnb import Linear4bit
         loaded_in_8bit = kwargs.pop("loaded_in_8bit", False)
         loaded_in_4bit = kwargs.pop("loaded_in_4bit", False)
 
-        # Unwrap if already an adapter
+        init_lars_weights = kwargs.pop("init_lars_weights", True)
+        rank = kwargs.pop("rank")
+        block_size = kwargs.pop("block_size")
+
         if isinstance(target, BaseTunerLayer):
             target_base_layer = target.get_base_layer()
         else:
             target_base_layer = target
 
-        # Quantized 4-bit
-        if loaded_in_4bit and "bnb" in globals() and isinstance(target_base_layer, bnb.nn.Linear4bit):
-            return LARSLinear(base_layer=target, rank=peft_config.rank)
+        # quantized dispatch
+        if loaded_in_8bit and is_bnb_available() and isinstance(target_base_layer, bnb.nn.Linear8bitLt):
+            eightbit_kwargs = kwargs.copy()
+            # match IA3's extra args pass-through
+            eightbit_kwargs.update(
+                {
+                    "has_fp16_weights": target_base_layer.state.has_fp16_weights,
+                    "threshold": target_base_layer.state.threshold,
+                    "index": target_base_layer.index,
+                }
+            )
+            return Linear8bitLt(
+                target,
+                adapter_name,
+                rank=rank,
+                block_size=block_size,
+                init_lars_weights=init_lars_weights,
+                **eightbit_kwargs,
+            )
 
-        # Quantized 8-bit
-        if loaded_in_8bit and "bnb" in globals() and isinstance(target_base_layer, bnb.nn.Linear8bitLt):
-            return LARSLinear(base_layer=target, rank=peft_config.rank)
+        if loaded_in_4bit and is_bnb_4bit_available() and isinstance(target_base_layer, bnb.nn.Linear4bit):
+            fourbit_kwargs = kwargs.copy()
+            fourbit_kwargs.update(
+                {
+                    "compute_dtype": target_base_layer.compute_dtype,
+                    "compress_statistics": target_base_layer.weight.compress_statistics,
+                    "quant_type": target_base_layer.weight.quant_type,
+                }
+            )
+            return Linear4bit(
+                target,
+                adapter_name,
+                rank=rank,
+                block_size=block_size,
+                init_lars_weights=init_lars_weights,
+                **fourbit_kwargs,
+            )
 
-        # Regular linear
-        if isinstance(target_base_layer, nn.Linear):
-            return LARSLinear(base_layer=target, rank=peft_config.rank)
+        # non-quant dispatch
+        if isinstance(target_base_layer, torch.nn.Linear):
+            if kwargs.get("fan_in_fan_out", False):
+                warnings.warn(
+                    "fan_in_fan_out=True but target is nn.Linear; setting fan_in_fan_out=False."
+                )
+                kwargs["fan_in_fan_out"] = lars_config.fan_in_fan_out = False
+            return Linear(
+                target,
+                adapter_name,
+                rank=rank,
+                block_size=block_size,
+                init_lars_weights=init_lars_weights,
+                **kwargs,
+            )
 
-        return None
+        # if isinstance(target_base_layer, Conv1D):
+        #     # Conv1D stores weight like (fan_in, fan_out)
+        #     if not kwargs.get("fan_in_fan_out", False):
+        #         warnings.warn(
+        #             "fan_in_fan_out=False but target is Conv1D; setting fan_in_fan_out=True."
+        #         )
+        #         kwargs["fan_in_fan_out"] = lars_config.fan_in_fan_out = True
+        #     return Linear(
+        #         target,
+        #         adapter_name,
+        #         rank=rank,
+        #         block_size=block_size,
+        #         init_lars_weights=init_lars_weights,
+        #         **kwargs,
+        #     )
 
+        raise ValueError(f"Target module {target} not supported for LARS.")
 
     def _create_and_replace(
         self,
-        peft_config: LARSConfig,
+        lars_config: LARSConfig,
         adapter_name: str,
         target: nn.Module,
         target_name: str,
         parent: nn.Module,
-        **kwargs,
+        current_key: str,
     ):
-        """
-        Replace nn.Linear with LARSLinear.
-        """
-
-        if not isinstance(target, (nn.Linear, bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)):
-            return
-
-        qkwargs = {
+        kwargs = {
+            "fan_in_fan_out": lars_config.fan_in_fan_out,
+            "init_lars_weights": lars_config.init_lars_weights,
+            "rank": lars_config.rank,
+            "block_size": lars_config.block_size,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
 
-        new_module = self._create_new_module(peft_config, adapter_name, target, **qkwargs)
-        if new_module is not None:
-            # Important: keep reference for PEFT bookkeeping
+        if isinstance(target, LARSLayer):
+            target.update_layer(adapter_name, lars_config.init_lars_weights)
+        else:
+            new_module = self._create_new_module(lars_config, adapter_name, target, **kwargs)
+            if adapter_name not in self.active_adapters:
+                new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
 
     def _replace_module(
@@ -130,55 +194,27 @@ class LARSModel(BaseTuner):
         new_module: nn.Module,
         old_module: nn.Module,
     ):
-        """
-        Same replacement logic as IA3.
-        """
-        setattr(parent, child_name, new_module)
-
+        """Replace module and move to correct device."""
         device = old_module.weight.device
         new_module.to(device) 
-        
-        if hasattr(old_module, "weight"):
-            new_module.base_layer.weight = old_module.weight
-        if hasattr(old_module, "bias") and old_module.bias is not None:
-            new_module.base_layer.bias = old_module.bias
+        setattr(parent, child_name, new_module)
 
-    def _mark_only_adapters_as_trainable(self, model: nn.Module):
-        print("=== MARK TRAINABLE DEBUG ===")
-        # 1. Freeze everything
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-        # 2. Unfreeze only LARS adapter params (floating point only)
-        trainable_count = 0
-        for name, module in self.model.named_modules():
-            if isinstance(module, LARSLinear):
-                # print(f"Found LARSLinear: {name}")
-                for param_name, param in module.named_parameters():
-                    # Skip quantized base_layer weights (int8) - they MUST stay frozen
-                    if param.dtype not in (torch.float16, torch.float32, torch.bfloat16, torch.float64):
-                        # print(f"  SKIP {param_name}: dtype={param.dtype} (quantized, stays frozen)")
-                        continue
-                    
-                    param.requires_grad = True
-                    trainable_count += param.numel()
-                    # print(f"  Unfroze {param_name}: {param.numel()} params, requires_grad={param.requires_grad}")
-        
-        print(f"Total LARS trainable params: {trainable_count}")
-        print("=== END DEBUG ===")
-
-
+    @staticmethod
+    def _prepare_adapter_config(peft_config: LARSConfig, model_config: dict):
+        if peft_config.target_modules is None:
+            raise ValueError("Please specify `target_modules` in `peft_config` for LARS.")
+        return peft_config
 
     # --------------------------------------------------
-    # Explicitly unsupported IA3 features
+    # Unsupported (LARS cannot merge/unload)
     # --------------------------------------------------
 
     def merge_and_unload(self):
         raise NotImplementedError(
-            "ActivationScaling adapters are activation-conditioned and cannot be merged into base weights."
+            "LARS adapters are activation-conditioned and cannot be merged."
         )
 
     def unload(self):
         raise NotImplementedError(
-            "ActivationScaling adapters cannot be unloaded independently of the base model."
+            "LARS adapters cannot be unloaded independently."
         )
