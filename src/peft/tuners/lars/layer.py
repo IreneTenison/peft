@@ -77,7 +77,7 @@ class LARSLayer(BaseTunerLayer):
         for active_adapter in self.active_adapters:
             if active_adapter not in self.lars_params:
                 continue
-            p = self.lars_params[adapter_name]
+            p = self.lars_params[active_adapters]
             # Projection logic in FP32
             proj = (z @ p["U"]) @ p["V"]
             inc = 1.0 + p["alpha"] * proj
@@ -86,8 +86,7 @@ class LARSLayer(BaseTunerLayer):
         if gate_accum is None:
             gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=torch.float32)
             
-        gate = gate_accum.repeat_interleave(self.block_size, dim=-1)  # [*, in_features]
-        return gate
+        return gate_accum
 
 class Linear(nn.Module, LARSLayer):
     def __init__(
@@ -118,7 +117,7 @@ class Linear(nn.Module, LARSLayer):
         if self.disable_adapters:
             return self.base_layer(x, *args, **kwargs)
 
-        gate = self._compute_gate(x)  # fp32
+        gate = self._compute_gate_logic(x)  # fp32
         x = x * gate.to(x.dtype)
         out = self.base_layer(x, *args, **kwargs)
         return out.to(previous_dtype)

@@ -26,22 +26,27 @@ if is_bnb_available():
             if getattr(self.get_base_layer(), "bias", None) is not None:
                 self.get_base_layer().bias.requires_grad = False
 
-                self._active_adapter = adapter_name
-                self.update_layer(adapter_name, init_lars_weights)
+            self._active_adapter = adapter_name
+            self.update_layer(adapter_name, init_lars_weights)
 
         def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            # print("inner autocast?", torch.is_autocast_enabled(), "x dtype", x.dtype)
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            requires_conversion = (not torch.is_autocast_enabled()) and (x.dtype != torch.float32)
-            if requires_conversion:
-                x = x.float()
+            x_in = x                      
+            x_fp32 = x_in.float() # for gate match
 
-            gate = self._compute_gate_logic(x)  # fp32
-            out = self.base_layer(x * gate.to(x.dtype), *args, **kwargs)
+            gate_small = self._compute_gate_logic(x_fp32)  # fp32
+            gate_small = gate_small.to(x_in.dtype).unsqueeze(-1)  # [..., g, 1]
+            # if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
+            #     print("x:", tuple(x.shape), x_in.dtype)
+            #     print("gate_small:", tuple(gate_small.shape), gate_small.dtype)
+            x_view = x_in.view(*x_in.shape[:-1], self.g, self.block_size)  # [..., g, block]
+            x_gated = (x_view * gate_small).reshape_as(x_in) 
+            
+            out = self.base_layer(x_gated, *args, **kwargs)
 
-            if requires_conversion:
-                out = out.to(out.dtype)
             return out
 
         def __repr__(self) -> str:
