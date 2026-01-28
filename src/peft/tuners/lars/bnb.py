@@ -34,20 +34,11 @@ if is_bnb_available():
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            x_in = x                      
-            x_fp32 = x_in.float() # for gate match
-
-            gate_small = self._compute_gate_logic(x_fp32)  # fp32
-            gate_small = gate_small.to(x_in.dtype).unsqueeze(-1)  # [..., g, 1]
-            # if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
-            #     print("x:", tuple(x.shape), x_in.dtype)
-            #     print("gate_small:", tuple(gate_small.shape), gate_small.dtype)
-            x_view = x_in.view(*x_in.shape[:-1], self.g, self.block_size)  # [..., g, block]
-            x_gated = (x_view * gate_small).reshape_as(x_in) 
+            gate_small = self._compute_gate_logic(x).unsqueeze(-1)  # [..., g, 1]
+            x_view = x.view(*x.shape[:-1], self.g, self.block_size)  # [..., g, block]
+            x_gated = (x_view * gate_small).reshape_as(x) 
             
-            out = self.base_layer(x_gated, *args, **kwargs)
-
-            return out
+            return self.base_layer(x_gated, *args, **kwargs)
 
         def __repr__(self) -> str:
             return "lars." + super().__repr__()
@@ -81,18 +72,12 @@ if is_bnb_4bit_available():
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            requires_conversion = (not torch.is_autocast_enabled()) and (x.dtype != torch.float32)
-            if requires_conversion:
-                x = x.float()
+            gate_small = self._compute_gate_logic(x).unsqueeze(-1)   # [..., g, 1]
+            x_view = x.view(*x.shape[:-1], self.g, self.block_size)
+            x_gated = (x_view * gate_small).reshape_as(x)
 
-            gate = self._compute_gate_logic(x)
-            out = self.base_layer(x * gate.to(x.dtype), *args, **kwargs)
-
-            out = out.clone()  # IA3/LoRA workaround for some torch/bnb combos
-
-            if requires_conversion:
-                out = out.to(out.dtype)
-            return out
+            out = self.base_layer(x_gated, *args, **kwargs)
+            return out.clone()   # keep this workaround if you want
 
         def __repr__(self) -> str:
             return "lars." + super().__repr__()

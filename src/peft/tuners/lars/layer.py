@@ -12,7 +12,7 @@ class LARSLayer(BaseTunerLayer):
     
     def __init__(self, base_layer, rank, block_size=32):
             self.base_layer = base_layer 
-            self.lars_params = nn.ParameterDict({})
+            self.lars_params = nn.ModuleDict({})
             
             self._disable_adapters = False
             self.merged_adapters = [] # not used, for PEFT compatability
@@ -40,27 +40,31 @@ class LARSLayer(BaseTunerLayer):
 
             self.g = self.in_features // block_size
 
+    def _infer_adapter_dtype_device(self):
+        base = self.get_base_layer()
+        # Prefer weight dtype if it exists and is floating point; else default fp16
+        if hasattr(base, "weight") and base.weight is not None and base.weight.is_floating_point():
+            return base.weight.dtype, base.weight.device
+        # bnb int8 weight is not floating; choose fp16 on the same device as the module parameters
+        device = next(self.base_layer.parameters(), torch.empty(0)).device
+        return torch.float16, device
+        
     def update_layer(self, adapter_name: str, init_lars_weights: bool, inference_mode: bool = False, **kwargs):
-        U = torch.empty((self.in_features, self.rank), dtype=torch.float32)
-        V = torch.empty((self.rank, self.g), dtype=torch.float32)
-        alpha = torch.tensor(0.1, dtype=torch.float32)
+        U = nn.Parameter(torch.empty((self.in_features, self.rank)))
+        V = nn.Parameter(torch.empty((self.rank, self.g)))
+        alpha = nn.Parameter(torch.tensor(0.1))
 
-        # Store params
         self.lars_params[adapter_name] = nn.ParameterDict(
-            {
-                "U": nn.Parameter(U),
-                "V": nn.Parameter(V),
-                "alpha": nn.Parameter(alpha),
-            }
+            {"U": U, "V": V, "alpha": alpha}
         )
 
         if init_lars_weights:
             nn.init.kaiming_uniform_(self.lars_params[adapter_name]["U"], a=math.sqrt(5))
             nn.init.normal_(self.lars_params[adapter_name]["V"], std=1e-4)
-
             with torch.no_grad():
                 self.lars_params[adapter_name]["alpha"].fill_(0.1)
 
+        # Move adapter to device/dtype of base layer (PEFT helper)
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
@@ -71,16 +75,16 @@ class LARSLayer(BaseTunerLayer):
                 self.lars_params[adapter_name]["alpha"].fill_(0.1)
 
     def _compute_gate_logic(self, x):
-        z = F.rms_norm(x, (self.in_features,), eps=1e-5).to(torch.float32)
+        z = F.rms_norm(x, (self.in_features,), eps=1e-5)        
         
         gate_accum = None
         for active_adapter in self.active_adapters:
             if active_adapter not in self.lars_params:
                 continue
-            p = self.lars_params[active_adapters]
+            p = self.lars_params[active_adapter]
             # Projection logic in FP32
-            proj = (z @ p["U"]) @ p["V"]
-            inc = 1.0 + p["alpha"] * proj
+            proj = (z @ p.U) @ p.V
+            inc = 1.0 + p.alpha * proj
             gate_accum = inc if gate_accum is None else gate_accum * inc # for multiple adapters
         
         if gate_accum is None:
@@ -112,15 +116,14 @@ class Linear(nn.Module, LARSLayer):
         self.update_layer(adapter_name, init_lars_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        previous_dtype = x.dtype
-        
         if self.disable_adapters:
             return self.base_layer(x, *args, **kwargs)
 
-        gate = self._compute_gate_logic(x)  # fp32
-        x = x * gate.to(x.dtype)
-        out = self.base_layer(x, *args, **kwargs)
-        return out.to(previous_dtype)
+        gate_small = self._compute_gate_logic(x).unsqueeze(-1)        
+        x_view = x.view(*x.shape[:-1], self.g, self.block_size)  
+        x_gated = (x_view * gate_small).reshape_as(x)   
+
+        return self.base_layer(x_gated, *args, **kwargs)          
 
     def __repr__(self) -> str:
         return "lars." + super().__repr__()
