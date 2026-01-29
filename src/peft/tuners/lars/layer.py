@@ -48,11 +48,13 @@ class LARSLayer(BaseTunerLayer):
         # bnb int8 weight is not floating; choose fp16 on the same device as the module parameters
         device = next(self.base_layer.parameters(), torch.empty(0)).device
         return torch.float16, device
-        
+
     def update_layer(self, adapter_name: str, init_lars_weights: bool, inference_mode: bool = False, **kwargs):
-        U = nn.Parameter(torch.empty((self.in_features, self.rank)))
-        V = nn.Parameter(torch.empty((self.rank, self.g)))
-        alpha = nn.Parameter(torch.tensor(0.1))
+        dtype, device = self._infer_adapter_dtype_device()
+        
+        U = nn.Parameter(torch.empty((self.in_features, self.rank), device=device, dtype=dtype))
+        V = nn.Parameter(torch.empty((self.rank, self.g), device=device, dtype=dtype))
+        alpha = nn.Parameter(torch.tensor(0.1, device=device, dtype=dtype))
 
         self.lars_params[adapter_name] = nn.ParameterDict(
             {"U": U, "V": V, "alpha": alpha}
@@ -83,13 +85,17 @@ class LARSLayer(BaseTunerLayer):
                 continue
             p = self.lars_params[active_adapter]
             # Projection logic in FP32
-            proj = (z @ p.U) @ p.V
-            inc = 1.0 + p.alpha * proj
+            U = p["U"].to(dtype=x.dtype)
+            V = p["V"].to(dtype=x.dtype)
+            alpha = p["alpha"].to(dtype=x.dtype)
+
+            proj = (z @ U) @ V
+            inc = 1.0 + alpha * proj
             gate_accum = inc if gate_accum is None else gate_accum * inc # for multiple adapters
         
         if gate_accum is None:
-            gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=torch.float32)
-            
+            gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=z.dtype)
+  
         return gate_accum
 
 class Linear(nn.Module, LARSLayer):

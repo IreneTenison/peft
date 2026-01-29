@@ -34,9 +34,21 @@ if is_bnb_available():
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            gate_small = self._compute_gate_logic(x).unsqueeze(-1)  # [..., g, 1]
+            if x.dtype == torch.float32:
+                x = x.to(torch.float16)
+
+            def _gate_fn(x):
+                return self._compute_gate_logic(x)
+
+            gate_small = checkpoint(_gate_fn, x).to(x.dtype).unsqueeze(-1)
+            # print("x", x.dtype, "gate_small", gate_small.dtype)
+
             x_view = x.view(*x.shape[:-1], self.g, self.block_size)  # [..., g, block]
             x_gated = (x_view * gate_small).reshape_as(x) 
+            # print("x_gated", x_gated.dtype)
+
+            # if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
+            #     print("x", x.dtype, "gate", gate_small.dtype, "x_gated", x_gated.dtype)
             
             return self.base_layer(x_gated, *args, **kwargs)
 
