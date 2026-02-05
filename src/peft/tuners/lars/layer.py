@@ -42,12 +42,15 @@ class LARSLayer(BaseTunerLayer):
 
     def _infer_adapter_dtype_device(self):
         base = self.get_base_layer()
-        # Prefer weight dtype if it exists and is floating point; else default fp16
+
+        if hasattr(base, "compute_dtype"):
+            return base.compute_dtype, base.weight.device
+
         if hasattr(base, "weight") and base.weight is not None and base.weight.is_floating_point():
             return base.weight.dtype, base.weight.device
-        # bnb int8 weight is not floating; choose fp16 on the same device as the module parameters
+
         device = next(self.base_layer.parameters(), torch.empty(0)).device
-        return torch.float16, device
+        return torch.bfloat16, device
 
     def update_layer(self, adapter_name: str, init_lars_weights: bool, inference_mode: bool = False, **kwargs):
         dtype, device = self._infer_adapter_dtype_device()
@@ -76,26 +79,28 @@ class LARSLayer(BaseTunerLayer):
             with torch.no_grad():
                 self.lars_params[adapter_name]["alpha"].fill_(0.1)
 
-    def _compute_gate_logic(self, x):
-        z = F.rms_norm(x, (self.in_features,), eps=1e-5)        
-        
+    def _compute_gate_logic(self, x: torch.Tensor) -> torch.Tensor:
+        # print("x type: ", x.dtype)
+        # x = x.to(torch.float16)               
+        z = F.rms_norm(x, (self.in_features,), eps=1e-5) 
+        # z = F.rms_norm(x, (self.in_features,), eps=1e-5)
+
         gate_accum = None
         for active_adapter in self.active_adapters:
-            if active_adapter not in self.lars_params:
-                continue
             p = self.lars_params[active_adapter]
-            # Projection logic in FP32
-            U = p["U"].to(dtype=x.dtype)
-            V = p["V"].to(dtype=x.dtype)
-            alpha = p["alpha"].to(dtype=x.dtype)
+            if p is None:
+                continue
+            # U, V, alpha = p["U"].to(torch.float16), p["V"].to(torch.float16), p["alpha"].to(torch.float16)
+            U, V, alpha = p["U"], p["V"], p["alpha"]
+            # print("x", x.dtype, "z", z.dtype, "U", U.dtype)
 
-            proj = (z @ U) @ V
-            inc = 1.0 + alpha * proj
-            gate_accum = inc if gate_accum is None else gate_accum * inc # for multiple adapters
-        
+            proj = (z @ U) @ V          
+            inc = proj.mul(alpha).add_(1.0)
+            gate_accum = inc if gate_accum is None else gate_accum.mul_(inc)
+
         if gate_accum is None:
-            gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=z.dtype)
-  
+            gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=x.dtype)
+
         return gate_accum
 
 class Linear(nn.Module, LARSLayer):

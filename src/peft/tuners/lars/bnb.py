@@ -29,27 +29,21 @@ if is_bnb_available():
             self._active_adapter = adapter_name
             self.update_layer(adapter_name, init_lars_weights)
 
-        def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-            # print("inner autocast?", torch.is_autocast_enabled(), "x dtype", x.dtype)
+        def forward(self, x, *args, **kwargs):
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            if x.dtype == torch.float32:
-                x = x.to(torch.float16)
+            def gated_x(t):
+                gate_small = self._compute_gate_logic(t).unsqueeze(-1)  # [..., g, 1]
+                t_view = t.view(*t.shape[:-1], self.g, self.block_size)
+                return (t_view * gate_small).reshape_as(t)
 
-            def _gate_fn(x):
-                return self._compute_gate_logic(x)
+            # gate_small = self._compute_gate_logic(x).unsqueeze(-1)  # [..., g, 1]
+            # x_view = x.view(*x.shape[:-1], self.g, self.block_size)
+            # x_gated = (x_view * gate_small).reshape_as(x)
 
-            gate_small = checkpoint(_gate_fn, x).to(x.dtype).unsqueeze(-1)
-            # print("x", x.dtype, "gate_small", gate_small.dtype)
-
-            x_view = x.view(*x.shape[:-1], self.g, self.block_size)  # [..., g, block]
-            x_gated = (x_view * gate_small).reshape_as(x) 
-            # print("x_gated", x_gated.dtype)
-
-            # if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
-            #     print("x", x.dtype, "gate", gate_small.dtype, "x_gated", x_gated.dtype)
-            
+            x_gated = checkpoint(gated_x, x, use_reentrant=False)
+            # print("x_gated: ", x_gated.dtype)
             return self.base_layer(x_gated, *args, **kwargs)
 
         def __repr__(self) -> str:
@@ -84,10 +78,16 @@ if is_bnb_4bit_available():
             if self.disable_adapters:
                 return self.base_layer(x, *args, **kwargs)
 
-            gate_small = self._compute_gate_logic(x).unsqueeze(-1)   # [..., g, 1]
-            x_view = x.view(*x.shape[:-1], self.g, self.block_size)
-            x_gated = (x_view * gate_small).reshape_as(x)
+            def gated_x(t):
+                gate_small = self._compute_gate_logic(t).unsqueeze(-1)  # [..., g, 1]
+                t_view = t.view(*t.shape[:-1], self.g, self.block_size)
+                return (t_view * gate_small).reshape_as(t)
 
+            # gate_small = self._compute_gate_logic(x).unsqueeze(-1)   # [..., g, 1]
+            # x_view = x.view(*x.shape[:-1], self.g, self.block_size)
+            # x_gated = (x_view * gate_small).reshape_as(x)
+
+            x_gated = checkpoint(gated_x, x, use_reentrant=False)
             out = self.base_layer(x_gated, *args, **kwargs)
             return out.clone()   # keep this workaround if you want
 
