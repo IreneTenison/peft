@@ -37,13 +37,27 @@ class LARSModel(BaseTuner):
     def __init__(self, model: nn.Module, config: LARSConfig, adapter_name: str):
         super().__init__(model=model, peft_config=config, adapter_name=adapter_name)
 
-        # HuggingFace convention
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            self.num_layers = len(model.model.layers)
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
-            self.num_layers = len(model.encoder.layer)
+        # HuggingFace convention (fixed for T5)
+        if hasattr(model, "model"):
+            # Check for encoder + decoder blocks
+            if hasattr(model.model, "encoder") and hasattr(model.model.encoder, "block"):
+                self.num_encoder_layers = len(model.model.encoder.block)
+            else:
+                self.num_encoder_layers = 0
+
+            if hasattr(model.model, "decoder") and hasattr(model.model.decoder, "block"):
+                self.num_decoder_layers = len(model.model.decoder.block)
+            else:
+                self.num_decoder_layers = 0
+
+            self.num_layers = self.num_encoder_layers + self.num_decoder_layers
+        elif hasattr(model, "encoder") and hasattr(model.encoder, "block"):
+            self.num_encoder_layers = len(model.encoder.block)
+            self.num_decoder_layers = len(model.decoder.block) if hasattr(model, "decoder") else 0
+            self.num_layers = self.num_encoder_layers + self.num_decoder_layers
         else:
             raise ValueError("Cannot infer number of transformer layers")
+
 
     # --------------------------------------------------
     # Required BaseTuner overrides
@@ -107,26 +121,41 @@ class LARSModel(BaseTuner):
         # 1. Freeze everything
         for p in self.model.parameters():
             p.requires_grad = False
-
-        # 2. ENABLE GRADIENT CHECKPOINTING (RIGHT PLACE)
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-        # Required for HF models
-        if hasattr(self.model.config, "use_cache"):
-            self.model.config.use_cache = False
         
-        if hasattr(self.model.config, "enable_input_require_grads"):
-            self.model.enable_input_require_grads()
+        if hasattr(self.model.config, "enable_input_reqs"):
+            self.model.config.enable_input_reqs = True
 
 
         # 2. Unfreeze only LARS adapter params
         for module in self.model.modules():
+
             if isinstance(module, LARSLinear):
-                for p in module.U.parameters():
+                for p in module.A_pool.parameters():
                     p.requires_grad = True
-                for p in module.V.parameters():
+                for p in module.B_pool.parameters():
                     p.requires_grad = True
+                # for p in module.experts.parameters():
+                #     p.requires_grad = True
+                for p in module.rank_ffn.parameters():
+                    p.requires_grad = True
+                for p in module.rank_gate_x.parameters():
+                    p.requires_grad = True
+                for p in module.rank_gate_h.parameters():
+                    p.requires_grad = True
+                for p in module.rank_norm.parameters():
+                    p.requires_grad = True
+                for p in module.token_scale.parameters():
+                    p.requires_grad = True
+                module.pool_proj.requires_grad = True
+                module.alpha.requires_grad = True
+                # module.beta.requires_grad = True
+                module.temp1.requires_grad = True
+                module.temp2.requires_grad = True
+                module.rank_mix.requires_grad = True
+
+                
+                
+
 
 
 

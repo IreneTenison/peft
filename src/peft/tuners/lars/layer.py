@@ -12,105 +12,85 @@ import torch.nn.functional as F
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch.utils.checkpoint import checkpoint
 
-# class LARSLinear(nn.Module, BaseTunerLayer):
-#     """
-#     PEFT-compatible low-rank activation scaling layer.
-#     """
-
-#     def __init__(
-#         self,
-#         base_layer: nn.Linear,
-#         rank: int,
-#         activation: str = "silu",
-#     ):
-#         super().__init__()
-
-#         if not isinstance(base_layer, nn.Linear):
-#             raise ValueError("LARSLinear only supports nn.Linear")
-
-#         self.in_features = base_layer.in_features
-#         self.out_features = base_layer.out_features
-#         self.rank = rank
-#         self.scaling = rank
-
-#         self.base_layer = base_layer
-#         self.base_layer.weight.requires_grad_(False)
-#         if self.base_layer.bias is not None:
-#             self.base_layer.bias.requires_grad_(False)
-
-#         self.merged_adapters = []
-
-#         # Low-rank activation adapter
-#         self.U = nn.Linear(self.in_features, rank, bias=False)
-#         nn.init.kaiming_uniform_(self.U.weight, a=math.sqrt(5))
-#         self.V = nn.Linear(rank, self.out_features, bias=False)
-#         nn.init.kaiming_uniform_(self.V.weight, a=math.sqrt(5))
-#         # nn.init.zeros_(self.V.weight)
-#         self.norm = nn.LayerNorm(self.in_features)
-
-#         # Nonlinearity
-#         if activation == "silu":
-#             self.act = nn.SiLU(inplace=True)
-
-#         # Initialization: identity at start (important for stability)
-#         # nn.init.zeros_(self.V.weight)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Forward pass:
-#             h = W x
-#             g = 1 + V(phi(U(h)))
-#             y = h * g
-#         """
-#         # h = self.base_layer(x)
-#         # # gate = 1.0 + self.V(self.act(self.U(h)))
-#         # gate = 1.0 + torch.tanh(self.V(self.act(self.U(self.norm(x)))))
-
-#         # return h * gate
-#         with torch.no_grad():
-#             h = self.base_layer(x)
-#         gate = 1 + 0.5*torch.tanh(self.V(self.act(self.U(self.norm(x)))))
-#         y = h*gate 
-#         return y
-
-
 class LARSLinear(nn.Module, BaseTunerLayer):
-    def __init__(self, base_layer, rank, block_size=32):
+    """
+    Low-memory activation-gated PEFT.
+    Gating happens in feature space (critical).
+    """
+    def __init__(self, base_layer: nn.Linear, rank: int = 8, per_token_rank = 1):
+        # only per_token = True works
         super().__init__()
         self.base = base_layer
         self.base.weight.requires_grad_(False)
+        if self.base.bias is not None:
+            self.base.bias.requires_grad_(False)
 
-        # d_out = base_layer.out_features
-        d_out = base_layer.in_features
-        assert d_out % block_size == 0
+        d_in = base_layer.in_features
+        d_out = base_layer.out_features
+        self.rank = rank
 
-        self.block = block_size
-        self.g = d_out // block_size
+        self.A_pool = nn.Linear(d_in, self.rank, bias=False)
+        self.B_pool = nn.Linear(self.rank, d_out, bias=False)
+       
+        nn.init.normal_(self.A_pool.weight, std=0.01)
+        nn.init.zeros_(self.B_pool.weight)
 
-        self.norm = nn.RMSNorm(base_layer.in_features)
-        self.U = nn.Linear(base_layer.in_features, rank, bias=False)
-        self.V = nn.Linear(rank, self.g, bias=False)
-        nn.init.kaiming_uniform_(self.U.weight, a=math.sqrt(5))
-        nn.init.normal_(self.V.weight, std=1e-4)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.rank_gate_x = nn.Linear(d_in, self.rank, bias=False)
+        self.rank_gate_h = nn.Linear(self.rank, self.rank, bias=False)
+        nn.init.zeros_(self.rank_gate_x.weight)
+        nn.init.zeros_(self.rank_gate_h.weight)
+
+
+        self.pool_proj = nn.Linear(d_in, 1, bias=False) 
+        # nn.init.zeros_(self.pool_proj.weight)
+
+        self.alpha = nn.Parameter(torch.ones(1)*0.5)
+        # self.beta = nn.Parameter(torch.ones(1)*0.1)
+        self.temp1 = nn.Parameter(torch.ones(1))
+        self.temp2 = nn.Parameter(torch.ones(1))
+
+        self.rank_ffn = nn.Sequential(
+            nn.Linear(rank, rank * 4),
+            nn.GELU(),
+            nn.Linear(rank * 4, rank)
+        )
+
+        self.rank_mix = nn.Parameter(torch.eye(rank, rank))
+        self.rank_norm = nn.LayerNorm(rank)
+
+
 
     def forward(self, x):
-        # with torch.no_grad():
-        #     h = self.base(x)
+        """
+        x: [B,S,d] or [B,d]
+        """
+        B,S,d = x.shape
+        base_out = self.base(x)
+        
+        pool_logits = self.pool_proj(x)                # [B, S, 1]
+        pool_weights = torch.softmax(pool_logits, dim=1)
+        x_pool = (x * pool_weights).sum(dim=1)
 
-        z = self.norm(x)
-        gate_small = 1 + self.alpha * self.V(self.U(z)) # [B, g]
-        gate = gate_small.repeat_interleave(self.block, dim=-1)
+        # x_pool = x.mean(dim=1) + x[:, -1] 
 
-        return self.base(x * gate)
+        h = self.A_pool(x_pool)  # [B,S,r]
+
+        h_norm = self.rank_norm(h)
+        g = torch.sigmoid(self.temp1 * self.rank_gate_x(x_pool) + self.temp2 * self.rank_gate_h(h_norm))
+        h_mixed = torch.matmul(g, self.rank_mix)
+        h = h_norm + h_mixed
+        h = F.dropout(h, p=0.1, training=self.training)
+        h = h + self.rank_ffn(h) 
+
+        out = self.B_pool(h)
+        out = base_out + self.alpha * out.unsqueeze(1)
+        return out
 
 
 
 
 
 
-
-#
     # ---------------------------
     # PEFT compatibility
     # ---------------------------
@@ -127,8 +107,8 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         """
         Expose base weight for PEFT / HF compatibility.
         """
-        return self.base_layer.weight
+        return self.base.weight
 
     @property
     def bias(self):
-        return self.base_layer.bias
+        return self.base.bias
