@@ -144,8 +144,8 @@ class LARSModel(BaseTuner):
                     p.requires_grad = True
                 for p in module.rank_norm.parameters():
                     p.requires_grad = True
-                for p in module.token_scale.parameters():
-                    p.requires_grad = True
+                # for p in module.token_scale.parameters():
+                #     p.requires_grad = True
                 module.pool_proj.requires_grad = True
                 module.alpha.requires_grad = True
                 # module.beta.requires_grad = True
