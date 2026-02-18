@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch.utils.checkpoint import checkpoint
 
+
+LARS_PARAMETER_BANK = {}
+
 class LARSLayer(BaseTunerLayer):
     adapter_layer_names = ("lars_params",)
     
@@ -30,6 +33,7 @@ class LARSLayer(BaseTunerLayer):
             else:
                 raise ValueError(f"Unsupported base layer type for LARS: {type(base)}")
 
+            self.layer_id = None
             self.in_features = base_layer.in_features
             self.out_features = base_layer.out_features
 
@@ -87,12 +91,23 @@ class LARSLayer(BaseTunerLayer):
 
         gate_accum = None
         for active_adapter in self.active_adapters:
-            p = self.lars_params[active_adapter]
-            if p is None:
-                continue
-            # U, V, alpha = p["U"].to(torch.float16), p["V"].to(torch.float16), p["alpha"].to(torch.float16)
-            U, V, alpha = p["U"], p["V"], p["alpha"]
-            # print("x", x.dtype, "z", z.dtype, "U", U.dtype)
+            # 2. Check if the "Bake" (Vectorization) is complete
+            if active_adapter in LARS_PARAMETER_BANK:
+                bank = LARS_PARAMETER_BANK[active_adapter]
+                
+                # Retrieve the slices for this specific layer ID
+                start_u, end_u = bank['indices_u'][self.layer_id]
+                start_v, end_v = bank['indices_v'][self.layer_id]
+                
+                # .view() ensures we are looking at the boulder, not making a new pebble
+                U = bank['U'][start_u:end_u].view(self.in_features, self.rank)
+                V = bank['V'][start_v:end_v].view(self.rank, self.g)
+                alpha = bank['alpha'][self.layer_id]
+            else:
+                # Fallback to standard params if vectorization hasn't run yet
+                p = self.lars_params[active_adapter]
+                if p is None: continue
+                U, V, alpha = p["U"], p["V"], p["alpha"]
 
             proj = (z @ U) @ V          
             inc = proj.mul(alpha).add_(1.0)
@@ -102,6 +117,78 @@ class LARSLayer(BaseTunerLayer):
             gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=x.dtype)
 
         return gate_accum
+
+        # gate_accum = None
+        # for active_adapter in self.active_adapters:
+        #     p = self.lars_params[active_adapter]
+        #     if p is None:
+        #         continue
+        #     # U, V, alpha = p["U"].to(torch.float16), p["V"].to(torch.float16), p["alpha"].to(torch.float16)
+        #     U, V, alpha = p["U"], p["V"], p["alpha"]
+        #     # print("x", x.dtype, "z", z.dtype, "U", U.dtype)
+
+        #     proj = (z @ U) @ V          
+        #     inc = proj.mul(alpha).add_(1.0)
+        #     gate_accum = inc if gate_accum is None else gate_accum.mul_(inc)
+
+        # if gate_accum is None:
+        #     gate_accum = torch.ones(z.shape[:-1] + (self.g,), device=z.device, dtype=x.dtype)
+
+        # return gate_accum
+
+def finalize_lars_vectorization(peft_model, adapter_name):
+    """
+    Finds all LARSLayers and glues their parameters into a contiguous bank.
+    """
+    lars_layers = [m for m in peft_model.modules() if isinstance(m, LARSLayer)]
+    if not lars_layers: return
+
+    device = lars_layers[0].get_base_layer().weight.device
+    dtype = getattr(lars_layers[0].get_base_layer(), "compute_dtype", torch.bfloat16)
+    
+    total_u = sum(l.in_features * l.rank for l in lars_layers)
+    total_v = sum(l.rank * l.g for l in lars_layers)
+    num_layers = len(lars_layers)
+
+    # Create the Vectorized Boulders
+    bank_u = nn.Parameter(torch.empty(total_u, device=device, dtype=dtype))
+    bank_v = nn.Parameter(torch.empty(total_v, device=device, dtype=dtype))
+    bank_alpha = nn.Parameter(torch.empty(num_layers, device=device, dtype=dtype))
+
+    indices_u, indices_v = [], []
+    curr_u, curr_v = 0, 0
+    
+    for i, layer in enumerate(lars_layers):
+        layer.layer_id = i 
+        
+        # Copy existing initialized weights into the bank
+        p = layer.lars_params[adapter_name]
+        
+        u_flat = p["U"].data.view(-1)
+        v_flat = p["V"].data.view(-1)
+        
+        len_u, len_v = u_flat.numel(), v_flat.numel()
+        
+        bank_u.data[curr_u : curr_u + len_u].copy_(u_flat)
+        bank_v.data[curr_v : curr_v + len_v].copy_(v_flat)
+        bank_alpha.data[i].copy_(p["alpha"].data)
+        
+        indices_u.append((curr_u, curr_u + len_u))
+        indices_v.append((curr_v, curr_v + len_v))
+        
+        curr_u += len_u
+        curr_v += len_v
+
+    # Register the bank globally
+    LARS_PARAMETER_BANK[adapter_name] = {
+        'U': bank_u, 'V': bank_v, 'alpha': bank_alpha,
+        'indices_u': indices_u, 'indices_v': indices_v
+    }
+    
+    # Register the banks as parameters on the PeftModel so they move to GPU & get saved
+    peft_model.register_parameter(f"{adapter_name}_lars_bank_u", bank_u)
+    peft_model.register_parameter(f"{adapter_name}_lars_bank_v", bank_v)
+    peft_model.register_parameter(f"{adapter_name}_lars_bank_alpha", bank_alpha)
 
 class Linear(nn.Module, LARSLayer):
     def __init__(

@@ -41,8 +41,9 @@ if is_bnb_available():
             # gate_small = self._compute_gate_logic(x).unsqueeze(-1)  # [..., g, 1]
             # x_view = x.view(*x.shape[:-1], self.g, self.block_size)
             # x_gated = (x_view * gate_small).reshape_as(x)
-
-            x_gated = checkpoint(gated_x, x, use_reentrant=False)
+            with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                x_gated = checkpoint(gated_x, x, use_reentrant=False)
+            # x_gated = checkpoint(gated_x, x, use_reentrant=False)
             # print("x_gated: ", x_gated.dtype)
             return self.base_layer(x_gated, *args, **kwargs)
 

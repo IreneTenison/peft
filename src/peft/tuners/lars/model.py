@@ -14,7 +14,7 @@ from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, check_target_mod
 from peft.utils import ModulesToSaveWrapper
 from peft.import_utils import is_bnb_available, is_bnb_4bit_available 
 
-from .layer import Linear, LARSLayer
+from .layer import Linear, LARSLayer, finalize_lars_vectorization
 from .config import LARSConfig
 from .bnb import Linear4bit, Linear8bitLt 
 
@@ -46,6 +46,17 @@ class LARSModel(BaseTuner):
             self.num_layers = len(model.encoder.layer)
         else:
             raise ValueError("Cannot infer number of transformer layers")
+    
+    def inject_adapter(self, model: nn.Module, adapter_name: str, *args, **kwargs):
+        """
+        Default PEFT injection, followed by our vectorization 'bake' step.
+        """
+        super().inject_adapter(model, adapter_name, *args, **kwargs)
+        
+        # After PEFT has replaced all modules with LARSLayers, 
+        # we glue their parameters into one contiguous bank.
+        print(f"Baking LARS parameters into vectorized bank for: {adapter_name}")
+        finalize_lars_vectorization(model, adapter_name)
 
     # --------------------------------------------------
     # Required BaseTuner overrides (COMPLETE)
