@@ -17,7 +17,7 @@ class LARSLinear(nn.Module, BaseTunerLayer):
     Low-memory activation-gated PEFT.
     Gating happens in feature space (critical).
     """
-    def __init__(self, base_layer: nn.Linear, rank: int = 8, per_token_rank = 1):
+    def __init__(self, base_layer: nn.Linear, rank: int = 8, learned_pooling: bool = False):
         # only per_token = True works
         super().__init__()
         self.base = base_layer
@@ -28,6 +28,7 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         d_in = base_layer.in_features
         d_out = base_layer.out_features
         self.rank = rank
+        self.learned_pooling = learned_pooling
 
         self.A_pool = nn.Linear(d_in, self.rank, bias=False)
         self.B_pool = nn.Linear(self.rank, d_out, bias=False)
@@ -40,9 +41,9 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         nn.init.zeros_(self.rank_gate_x.weight)
         nn.init.zeros_(self.rank_gate_h.weight)
 
-
-        self.pool_proj = nn.Linear(d_in, 1, bias=False) 
-        # nn.init.zeros_(self.pool_proj.weight)
+        if self.learned_pooling:
+            self.pool_proj = nn.Linear(d_in, 1, bias=False) 
+            nn.init.zeros_(self.pool_proj.weight)
 
         self.alpha = nn.Parameter(torch.ones(1)*0.5)
         # self.beta = nn.Parameter(torch.ones(1)*0.1)
@@ -66,12 +67,12 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         """
         B,S,d = x.shape
         base_out = self.base(x)
-        
-        pool_logits = self.pool_proj(x)                # [B, S, 1]
-        pool_weights = torch.softmax(pool_logits, dim=1)
-        x_pool = (x * pool_weights).sum(dim=1)
-
-        # x_pool = x.mean(dim=1) + x[:, -1] 
+        if self.learned_pooling:
+            pool_logits = self.pool_proj(x)                # [B, S, 1]
+            pool_weights = torch.softmax(pool_logits, dim=1)
+            x_pool = (x * pool_weights).sum(dim=1)
+        else:
+            x_pool = x.mean(dim=1) + x[:, -1] 
 
         h = self.A_pool(x_pool)  # [B,S,r]
 

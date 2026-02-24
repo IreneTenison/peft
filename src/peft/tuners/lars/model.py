@@ -97,6 +97,7 @@ class LARSModel(BaseTuner):
         new_module = LARSLinear(
             base_layer=target,
             rank=peft_config.rank,
+            learned_pooling=peft_config.learned_pooling,
         )
 
         # Important: keep reference for PEFT bookkeeping
@@ -146,12 +147,14 @@ class LARSModel(BaseTuner):
                     p.requires_grad = True
                 # for p in module.token_scale.parameters():
                 #     p.requires_grad = True
-                module.pool_proj.requires_grad = True
                 module.alpha.requires_grad = True
                 # module.beta.requires_grad = True
                 module.temp1.requires_grad = True
                 module.temp2.requires_grad = True
                 module.rank_mix.requires_grad = True
+
+                if module.learned_pooling:
+                    module.pool_proj.requires_grad = True
 
                 
                 

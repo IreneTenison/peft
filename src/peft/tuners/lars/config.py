@@ -99,6 +99,11 @@ class LARSConfig(PeftConfig):
         metadata={"help": "Rank of the low-rank activation adapter"},
     )
 
+    learned_pooling: bool = field(
+        default=False,
+        metadata={"help": "Whether to use a learned pooling mechanism to pool the input activations into the low-rank space."},
+    )
+
 
     def __post_init__(self):
         super().__post_init__()
