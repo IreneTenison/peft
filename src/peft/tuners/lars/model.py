@@ -10,10 +10,11 @@ from typing import Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 
-from peft.tuners.tuners_utils import BaseTuner
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
-
-from .layer import LARSLinear
+from peft.import_utils import is_bnb_4bit_available, is_bnb_available
+ 
+from .layer import LARSLayer, LARSLinear
 from .config import LARSConfig
 
 
@@ -64,6 +65,28 @@ class LARSModel(BaseTuner):
     # --------------------------------------------------
 
     @staticmethod
+    def _create_new_module(lars_config, adapter_name, target, **kwargs):
+        loaded_in_8bit = kwargs.pop("loaded_in_8bit", False)
+        loaded_in_4bit = kwargs.pop("loaded_in_4bit", False)
+        
+        # Extract config values
+        config_kwargs = {
+            "rank": lars_config.rank,
+            "learned_pooling": lars_config.learned_pooling,
+        }
+        config_kwargs.update(kwargs)
+
+        if loaded_in_8bit and is_bnb_available():
+            from .bnb import Linear8bitLt
+            return Linear8bitLt(target, **config_kwargs)
+        
+        if loaded_in_4bit and is_bnb_4bit_available():
+            from .bnb import Linear4bit
+            return Linear4bit(target, **config_kwargs)
+
+        return LARSLinear(target, **config_kwargs)
+
+    @staticmethod
     def _check_target_module_feedforward(lars_config, key) -> bool:
         """
         Same logic as IA3: regex or exact match.
@@ -91,8 +114,13 @@ class LARSModel(BaseTuner):
         Replace nn.Linear with LARSLinear.
         """
 
-        if not isinstance(target, nn.Linear):
+        if not isinstance(target, (nn.Linear, BaseTunerLayer)):
             return
+
+        kwargs.update({
+            "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
+            "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
+        })
 
         new_module = LARSLinear(
             base_layer=target,
@@ -100,6 +128,7 @@ class LARSModel(BaseTuner):
             learned_pooling=peft_config.learned_pooling,
         )
 
+        new_module = self._create_new_module(peft_config, adapter_name, target, **kwargs)
         # Important: keep reference for PEFT bookkeeping
         self._replace_module(parent, target_name, new_module, target)
 
@@ -130,7 +159,7 @@ class LARSModel(BaseTuner):
         # 2. Unfreeze only LARS adapter params
         for module in self.model.modules():
 
-            if isinstance(module, LARSLinear):
+            if isinstance(module, LARSLayer):
                 for p in module.A_pool.parameters():
                     p.requires_grad = True
                 for p in module.B_pool.parameters():
