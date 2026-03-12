@@ -101,9 +101,9 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         h = F.dropout(h, p=0.1, training=self.training)
         h = h + self.rank_ffn(h) 
 
-    #     out = self.B_pool(h)
-    #     out = base_out + self.alpha * out.unsqueeze(1)
-    #     return out
+        out = self.B_pool(h)
+        out = base_out + self.alpha * out.unsqueeze(1)
+        return out
 
 
 
