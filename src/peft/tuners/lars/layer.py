@@ -65,7 +65,7 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         """
         x: [B,S,d] or [B,d]
         """
-        dtype = x.dtype
+        dtype = x.float()
         self.A_pool = self.A_pool.to(dtype)
         self.B_pool = self.B_pool.to(dtype)
         self.rank_gate_x = self.rank_gate_x.to(dtype)
