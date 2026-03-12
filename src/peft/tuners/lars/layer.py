@@ -79,7 +79,7 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         self.alpha = self.alpha.float()
         self.temp1 = self.temp1.float()
         self.temp2 = self.temp2.float()
-        
+
         B,S,d = x.shape
         base_out = self.base(x)
         if self.learned_pooling:
@@ -91,13 +91,13 @@ class LARSLinear(nn.Module, BaseTunerLayer):
 
         h = self.A_pool(x_pool)  # [B,S,r]
 
-        # h_norm = self.rank_norm(h)
-        # g = torch.sigmoid(self.temp1 * self.rank_gate_x(x_pool) + self.temp2 * self.rank_gate_h(h_norm))
-        g = h
+        h_norm = self.rank_norm(h)
+        g = torch.sigmoid(self.temp1 * self.rank_gate_x(x_pool) + self.temp2 * self.rank_gate_h(h_norm))
+        # g = h
         # h = g
         h_mixed = torch.matmul(g, self.rank_mix)
-        h = h_mixed
-        # h = h_norm + h_mixed
+        # h = h_mixed
+        h = h_norm + h_mixed
         h = F.dropout(h, p=0.1, training=self.training)
         h = h + self.rank_ffn(h) 
 
