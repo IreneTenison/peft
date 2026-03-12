@@ -65,20 +65,21 @@ class LARSLinear(nn.Module, BaseTunerLayer):
         """
         x: [B,S,d] or [B,d]
         """
-        dtype = x.float()
-        self.A_pool = self.A_pool.to(dtype)
-        self.B_pool = self.B_pool.to(dtype)
-        self.rank_gate_x = self.rank_gate_x.to(dtype)
-        self.rank_gate_h = self.rank_gate_h.to(dtype)
+        x = x.float()
+        self.base = self.base.float()
+        self.A_pool = self.A_pool.float()
+        self.B_pool = self.B_pool.float()
+        self.rank_gate_x = self.rank_gate_x.float()
+        self.rank_gate_h = self.rank_gate_h.float()
         if self.learned_pooling:
-            self.pool_proj = self.pool_proj.to(dtype)
-        self.rank_mix = self.rank_mix.to(dtype)
-        self.rank_ffn = self.rank_ffn.to(dtype)
-        self.rank_norm = self.rank_norm.to(dtype)
-        self.alpha = self.alpha.to(dtype)
-        self.temp1 = self.temp1.to(dtype)
-        self.temp2 = self.temp2.to(dtype)
-
+            self.pool_proj = self.pool_proj.float()
+        self.rank_ffn = self.rank_ffn.float()
+        self.rank_mix = self.rank_mix.float()
+        self.rank_norm = self.rank_norm.float()
+        self.alpha = self.alpha.float()
+        self.temp1 = self.temp1.float()
+        self.temp2 = self.temp2.float()
+        
         B,S,d = x.shape
         base_out = self.base(x)
         if self.learned_pooling:
